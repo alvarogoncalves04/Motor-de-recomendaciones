@@ -1,5 +1,5 @@
 # 04_dashboard.py
-# DASHBOARD DE RECOMENDACIONES CON STREAMLIT
+# DASHBOARD DE RECOMENDACIONES CON CLUSTERING
 
 import streamlit as st
 import sqlite3
@@ -28,34 +28,53 @@ def cargar_datos():
     
     clientes = pd.read_sql_query("SELECT * FROM clientes", conn)
     productos = pd.read_sql_query("SELECT * FROM productos", conn)
-    matriz = pd.read_sql_query("SELECT * FROM matriz_usuarios_productos", conn)
     popularidad = pd.read_sql_query("SELECT * FROM popularidad", conn)
     total_gastado = pd.read_sql_query("SELECT * FROM total_gastado", conn)
     
+    # Cargar clusters (si existen)
+    try:
+        clientes_cluster = pd.read_sql_query("SELECT * FROM clientes_con_cluster", conn)
+        tiene_clusters = True
+    except:
+        clientes_cluster = None
+        tiene_clusters = False
+    
     conn.close()
     
-    return clientes, productos, matriz, popularidad, total_gastado
+    return clientes, productos, popularidad, total_gastado, clientes_cluster, tiene_clusters
 
-clientes, productos, matriz, popularidad, total_gastado = cargar_datos()
+clientes, productos, popularidad, total_gastado, clientes_cluster, tiene_clusters = cargar_datos()
 
 # ============================================
 # SIDEBAR - SELECCIÓN DE CLIENTE
 # ============================================
 st.sidebar.header("🔍 Seleccionar Cliente")
 
-# Selector de cliente
 nombres_clientes = clientes['nombre'].tolist()
 cliente_seleccionado = st.sidebar.selectbox(
     "Elige un cliente",
     nombres_clientes
 )
 
-# Obtener ID del cliente
 cliente_id = clientes[clientes['nombre'] == cliente_seleccionado]['id_cliente'].values[0]
-
-# Obtener datos del cliente
 cliente_info = clientes[clientes['id_cliente'] == cliente_id].iloc[0]
 gasto = total_gastado[total_gastado['id_cliente'] == cliente_id]
+
+# ============================================
+# INFORMACIÓN DEL CLUSTER (si existe)
+# ============================================
+if tiene_clusters:
+    cluster_cliente = clientes_cluster[clientes_cluster['id_cliente'] == cliente_id]['cluster'].values[0]
+    cluster_info = clientes_cluster[clientes_cluster['cluster'] == cluster_cliente]
+    
+    st.sidebar.subheader("📊 Información del Cluster")
+    st.sidebar.write(f"**Cluster:** {cluster_cliente}")
+    st.sidebar.write(f"**Clientes en cluster:** {len(cluster_info)}")
+    
+    # Gasto promedio del cluster
+    ids_cluster = cluster_info['id_cliente'].tolist()
+    gasto_cluster = total_gastado[total_gastado['id_cliente'].isin(ids_cluster)]['total_gastado'].mean()
+    st.sidebar.write(f"**Gasto promedio cluster:** ${gasto_cluster:,.2f}")
 
 # ============================================
 # FILA 1: INFORMACIÓN DEL CLIENTE
@@ -74,7 +93,6 @@ with col3:
     st.metric("💰 Total Gastado", f"${gasto['total_gastado'].values[0]:,.2f}" if not gasto.empty else "$0.00")
 
 with col4:
-    # Productos comprados por el cliente
     conn = sqlite3.connect('data/olap.db')
     compras_cliente = pd.read_sql_query(
         f"SELECT COUNT(*) as num_compras FROM compras_enriquecidas WHERE id_cliente = {cliente_id}",
@@ -86,11 +104,10 @@ with col4:
 st.markdown("---")
 
 # ============================================
-# FILA 2: RECOMENDACIONES
+# FILA 2: RECOMENDACIONES (MEJORADAS CON CLUSTERS)
 # ============================================
 st.subheader("🎯 Productos Recomendados para este Cliente")
 
-# Obtener productos que el cliente NO ha comprado
 conn = sqlite3.connect('data/olap.db')
 productos_comprados = pd.read_sql_query(
     f"SELECT id_producto FROM compras_enriquecidas WHERE id_cliente = {cliente_id}",
@@ -101,27 +118,53 @@ conn.close()
 productos_comprados_lista = productos_comprados['id_producto'].tolist()
 productos_no_comprados = productos[~productos['id_producto'].isin(productos_comprados_lista)]
 
-# Recomendar los productos más populares NO comprados
-recomendaciones = productos_no_comprados.merge(popularidad, on='id_producto', how='left')
-recomendaciones = recomendaciones.sort_values('total_compras', ascending=False).head(5)
+# Si hay clusters, recomendar productos populares en el mismo cluster
+if tiene_clusters:
+    # Obtener productos comprados por otros clientes del mismo cluster
+    ids_cluster = cluster_info['id_cliente'].tolist()
+    conn = sqlite3.connect('data/olap.db')
+    query = f"""
+    SELECT id_producto, COUNT(*) as frecuencia
+    FROM compras_enriquecidas
+    WHERE id_cliente IN ({','.join(map(str, ids_cluster))})
+    AND id_producto NOT IN ({','.join(map(str, productos_comprados_lista)) if productos_comprados_lista else '0'})
+    GROUP BY id_producto
+    ORDER BY frecuencia DESC
+    LIMIT 5
+    """
+    recomendaciones_cluster = pd.read_sql_query(query, conn)
+    conn.close()
+    
+    if not recomendaciones_cluster.empty:
+        # Obtener detalles de los productos recomendados
+        ids_recomendados = recomendaciones_cluster['id_producto'].tolist()
+        recomendaciones = productos[productos['id_producto'].isin(ids_recomendados)]
+        recomendaciones = recomendaciones.merge(recomendaciones_cluster, on='id_producto', how='left')
+        recomendaciones = recomendaciones.sort_values('frecuencia', ascending=False)
+        metodo = "basado en tu cluster"
+    else:
+        # Fallback: productos populares globales
+        recomendaciones = productos_no_comprados.merge(popularidad, on='id_producto', how='left')
+        recomendaciones = recomendaciones.sort_values('total_compras', ascending=False).head(5)
+        metodo = "populares globalmente"
+else:
+    # Sin clusters: productos populares globales
+    recomendaciones = productos_no_comprados.merge(popularidad, on='id_producto', how='left')
+    recomendaciones = recomendaciones.sort_values('total_compras', ascending=False).head(5)
+    metodo = "populares globalmente"
 
 if not recomendaciones.empty:
+    st.caption(f"📌 Recomendaciones {metodo}")
     cols = st.columns(5)
     
     for idx, (_, row) in enumerate(recomendaciones.iterrows()):
-        # Verificar si la columna existe
-        nombre = row.get('nombre', 'Producto')
-        categoria = row.get('categoria', 'General')
-        precio = row.get('precio', 0.0)
-        total_compras = row.get('total_compras', 0)
-        
         with cols[idx]:
             st.markdown(f"""
             <div style="border:1px solid #ddd; border-radius:10px; padding:15px; text-align:center; background-color:#f9f9f9;">
-                <h4 style="margin:0; color:#2c3e50;">{nombre}</h4>
-                <p style="margin:5px 0; color:#7f8c8d;">{categoria}</p>
-                <p style="margin:5px 0; font-size:18px; font-weight:bold; color:#27ae60;">${precio:.2f}</p>
-                <p style="margin:5px 0; font-size:14px; color:#3498db;">⭐ {total_compras} compras</p>
+                <h4 style="margin:0; color:#2c3e50;">{row['nombre']}</h4>
+                <p style="margin:5px 0; color:#7f8c8d;">{row['categoria']}</p>
+                <p style="margin:5px 0; font-size:18px; font-weight:bold; color:#27ae60;">${row['precio']:.2f}</p>
+                <p style="margin:5px 0; font-size:14px; color:#3498db;">⭐ {row.get('frecuencia', row.get('total_compras', 0))} compras</p>
             </div>
             """, unsafe_allow_html=True)
 else:
@@ -132,15 +175,11 @@ st.markdown("---")
 # ============================================
 # FILA 3: GRÁFICOS
 # ============================================
-# ============================================
-# FILA 3: GRÁFICOS
-# ============================================
 col1, col2 = st.columns(2)
 
 with col1:
     st.subheader("📊 Top 10 Productos Más Populares")
     fig, ax = plt.subplots(figsize=(8, 6))
-    # popularidad ya tiene nombre, categoria, precio desde el ETL
     top_populares = popularidad.head(10).copy()
     ax.barh(top_populares['nombre'], top_populares['total_compras'], color='#3498db')
     ax.set_xlabel("Número de Compras")
@@ -156,7 +195,32 @@ with col2:
     plt.close()
 
 # ============================================
-# FILA 4: HISTORIAL DE COMPRAS DEL CLIENTE
+# FILA 4: DISTRIBUCIÓN DE CLUSTERS
+# ============================================
+if tiene_clusters:
+    st.subheader("📊 Distribución de Clientes por Cluster")
+    
+    col1, col2 = st.columns(2)
+    
+    with col1:
+        fig, ax = plt.subplots(figsize=(8, 6))
+        cluster_counts = clientes_cluster['cluster'].value_counts().sort_index()
+        ax.bar(cluster_counts.index, cluster_counts.values, color='#9b59b6')
+        ax.set_xlabel("Cluster")
+        ax.set_ylabel("Número de Clientes")
+        st.pyplot(fig)
+        plt.close()
+    
+    with col2:
+        st.write("**Características de cada cluster:**")
+        for i in range(len(cluster_counts)):
+            cluster_data = clientes_cluster[clientes_cluster['cluster'] == i]
+            ids = cluster_data['id_cliente'].tolist()
+            gasto_prom = total_gastado[total_gastado['id_cliente'].isin(ids)]['total_gastado'].mean()
+            st.write(f"🔹 **Cluster {i}:** {len(cluster_data)} clientes, ${gasto_prom:,.2f} promedio")
+
+# ============================================
+# FILA 5: HISTORIAL DE COMPRAS
 # ============================================
 st.subheader("📋 Historial de Compras del Cliente")
 
